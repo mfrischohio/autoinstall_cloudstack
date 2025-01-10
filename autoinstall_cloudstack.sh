@@ -1,6 +1,7 @@
 #!/bin/sh
 
-SSH_PUBLIC_KEY='insert_your_ssh_public_key_here'
+SSH_PUBLIC_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIMve2vqRZGfq6LW7FazjDshu9CgdqBbxoUBOhE9x8ODBAAAABHNzaDo= michael@mfrisch.com
+'
 
 function add_ssh_public_key() {
     cd
@@ -32,22 +33,107 @@ function get_nfs_network() {
     read -p ' accept access from (ex:192.168.1.0/24): ' NETWORK
 }
 
+function configure_networks() {
+    # Management Network
+    cat << EOF > /etc/NetworkManager/system-connections/enp6s18.nmconnection
+[connection]
+id=enp6s18
+type=ethernet
+interface-name=enp6s18
+
+[ipv4]
+method=manual
+addresses=192.168.86.35/24
+gateway=192.168.86.1
+dns=8.8.8.8;8.8.4.4
+EOF
+
+    # Public Network
+    cat << EOF > /etc/NetworkManager/system-connections/enp6s19.nmconnection
+[connection]
+id=enp6s19
+type=ethernet
+interface-name=enp6s19
+
+[ipv4]
+method=manual
+addresses=192.168.86.36/24
+EOF
+
+    # Storage Network
+    cat << EOF > /etc/NetworkManager/system-connections/enp6s20.nmconnection
+[connection]
+id=enp6s20
+type=ethernet
+interface-name=enp6s20
+
+[ipv4]
+method=manual
+addresses=192.168.86.37/24
+EOF
+
+    chmod 600 /etc/NetworkManager/system-connections/*.nmconnection
+    systemctl restart NetworkManager
+}
+
+function configure_mysql() {
+    # Create MySQL config directory if not exists
+    mkdir -p /etc/my.cnf.d/
+
+    # Create CloudStack MySQL config
+    cat << EOF > /etc/my.cnf.d/cloudstack.cnf
+[mysqld]
+max_connections = 1000
+innodb_buffer_pool_size = 1G
+innodb_lock_wait_timeout = 600
+max_allowed_packet = 32M
+thread_cache_size = 32
+EOF
+
+    # Restart MySQL and verify
+    systemctl restart mysqld
+    sleep 5
+    mysql -e "SHOW VARIABLES LIKE 'max_connections';"
+}
+
 function install_common() {
-    yum update -y
-    sed -i -e 's/SELINUX=enforcing/SELINUX=permissive/g' /etc/selinux/config
+    # System Setup
+    dnf update -y
+    dnf install epel-release -y
+    dnf config-manager --set-enabled crb
+
+    # Configure Networks
+    configure_networks
+
+    # SELinux Configuration
     setenforce permissive
-    echo "[cloudstack]
-name=cloudstack
-baseurl=http://cloudstack.apt-get.eu/rhel/4.5/
+    sed -i -e 's/SELINUX=enforcing/SELINUX=permissive/g' /etc/selinux/config
+
+    # CloudStack Repository
+    cat << EOF > /etc/yum.repos.d/cloudstack.repo
+[cloudstack]
+name=CloudStack
+baseurl=http://download.cloudstack.org/centos/9/4.20/
 enabled=1
-gpgcheck=0" > /etc/yum.repos.d/CloudStack.repo
-    sed -i -e "s/localhost/$HOSTNAME localhost/" /etc/hosts
-    yum install ntp wget -y
-    service ntpd start
-    chkconfig ntpd on
-    wget http://download.cloud.com.s3.amazonaws.com/tools/vhd-util
-    mkdir -p /usr/share/cloudstack-common/common/scripts/vm/hypervisor/xenserver
-    mv vhd-util /usr/share/cloudstack-common/common/scripts/vm/hypervisor/xenserver
+gpgcheck=0
+EOF
+
+    # Install Packages
+    dnf clean all
+    dnf makecache
+    dnf install -y wget chrony qemu-kvm libvirt libvirt-client net-tools bridge-utils vconfig python3-libvirt
+    dnf install -y cloudstack-management cloudstack-common mariadb-server
+
+    # Enable Services
+    systemctl enable --now chronyd
+    systemctl enable --now libvirtd
+    systemctl enable --now mariadb
+
+    # Setup Database
+    cloudstack-setup-databases cloud:cloud@localhost --deploy-as=root
+
+    # Add MySQL configuration after database installation
+    configure_mysql
 }
 
 function install_management() {
@@ -108,7 +194,10 @@ function initialize_storage() {
     sleep 10
     rm -rf /mnt/primary/*
     rm -rf /mnt/secondary/*
-    /usr/share/cloudstack-common/scripts/storage/secondary/cloud-install-sys-tmplt -m /mnt/secondary -u http://cloudstack.apt-get.eu/systemvm/4.5/systemvm64template-4.5-kvm.qcow2.bz2 -h kvm -F
+    /usr/share/cloudstack-common/scripts/storage/secondary/cloud-install-sys-tmplt \
+      -m /export/secondary \
+      -u http://download.cloudstack.org/systemvm/4.20/systemvmtemplate-4.20.0-kvm.qcow2.bz2 \
+      -h kvm -F
     sync
     umount /mnt/primary
     umount /mnt/secondary
